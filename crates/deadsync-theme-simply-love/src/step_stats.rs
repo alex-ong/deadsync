@@ -1,8 +1,12 @@
+use deadlib_present::space::Metrics;
 use deadsync_profile::PlayerSide;
+use glam::Mat4;
 
 pub const STEP_STATS_SONG_BANNER_ZOOM: f32 = 0.4;
 pub const STEP_STATS_BANNER_W: f32 = 418.0;
 pub const STEP_STATS_BANNER_H: f32 = 164.0;
+pub const STEP_STATS_PANE_CONTENT_W: f32 = 400.0;
+const STEP_STATS_SONG_INFO_PADDING: f32 = 4.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StepStatsPaneParams {
@@ -43,10 +47,39 @@ pub struct StepStatsGraphRect {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepStatsPaneRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+#[must_use]
+pub fn step_stats_aspect_enabled(screen_w: f32, screen_h: f32) -> bool {
+    screen_h > 0.0 && screen_w >= screen_h
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StepStatsSpritePlacement {
     pub x: f32,
     pub y: f32,
     pub zoom: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepStatsSongInfoSlide {
+    pub left: f32,
+    pub center_y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub banner_width: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepStatsSongInfoTextPlacement {
+    pub labels_x: f32,
+    pub values_x: f32,
+    pub values_max_width: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -108,11 +141,58 @@ pub fn pane_layout(params: StepStatsPaneParams) -> StepStatsPaneLayout {
 }
 
 #[must_use]
-pub fn song_info_text_zoom(layout: StepStatsPaneLayout, screen_aspect_ratio: f32) -> f32 {
-    let mut zoom = 0.75;
-    if layout.note_field_is_centered {
-        zoom = if screen_aspect_ratio > 1.7 { 0.9 } else { 0.95 };
+pub fn pane_position_scale(layout: StepStatsPaneLayout) -> f32 {
+    (layout.sidepane_width / STEP_STATS_PANE_CONTENT_W).min(1.0)
+}
+
+#[must_use]
+pub fn pane_anchor_x(layout: StepStatsPaneLayout, local_x: f32) -> f32 {
+    local_x.mul_add(pane_position_scale(layout), layout.sidepane_center_x)
+}
+
+#[must_use]
+pub fn pane_view_proj(screen_w: f32, screen_h: f32) -> Mat4 {
+    Metrics::centered(screen_w, screen_h).projection()
+}
+
+#[must_use]
+pub fn pane_rect(layout: StepStatsPaneLayout, screen_h: f32) -> StepStatsPaneRect {
+    StepStatsPaneRect {
+        left: layout.sidepane_center_x - layout.sidepane_width * 0.5,
+        top: 0.0,
+        right: layout.sidepane_center_x + layout.sidepane_width * 0.5,
+        bottom: screen_h.max(0.0),
     }
+}
+
+#[must_use]
+pub fn judgment_count_center_x(
+    layout: StepStatsPaneLayout,
+    player_side: PlayerSide,
+    wide: bool,
+    num_players: usize,
+) -> f32 {
+    let side_sign = match player_side {
+        PlayerSide::P1 => 1.0,
+        PlayerSide::P2 => -1.0,
+    };
+    let local_x = if layout.is_ultrawide && num_players > 1 {
+        154.0 * side_sign
+    } else if layout.note_field_is_centered && wide {
+        -156.0 * side_sign
+    } else {
+        -(if wide { 204.0 } else { 152.0 }) * side_sign
+    };
+    layout.sidepane_center_x + local_x * layout.banner_data_zoom
+}
+
+#[must_use]
+pub fn song_info_text_zoom(layout: StepStatsPaneLayout) -> f32 {
+    let zoom = if layout.note_field_is_centered {
+        0.9
+    } else {
+        0.75
+    };
     zoom * layout.banner_data_zoom
 }
 
@@ -158,35 +238,99 @@ pub fn song_banner_placement(
         local_x *= -1.0;
     }
     StepStatsSpritePlacement {
-        x: layout.sidepane_center_x + local_x * layout.banner_data_zoom,
+        x: pane_anchor_x(layout, local_x * layout.banner_data_zoom),
         y: 200.0f32.mul_add(-layout.banner_data_zoom, layout.sidepane_center_y),
         zoom: STEP_STATS_SONG_BANNER_ZOOM * layout.banner_data_zoom,
     }
 }
 
 #[must_use]
-pub fn pack_banner_placement(
+pub fn song_info_slide(
     layout: StepStatsPaneLayout,
     player_side: PlayerSide,
-) -> StepStatsSpritePlacement {
-    let final_size = if layout.note_field_is_centered {
+    wide: bool,
+    num_players: usize,
+    show_duration: bool,
+    live_timing_rows: usize,
+    graph_top: f32,
+) -> StepStatsSongInfoSlide {
+    let pane_left = layout.sidepane_center_x - layout.sidepane_width * 0.5;
+    let pane_right = layout.sidepane_center_x + layout.sidepane_width * 0.5;
+    let time_anchor = judgment_count_center_x(layout, player_side, wide, num_players);
+    let timing_frame = scorebox_frame(layout, wide, player_side, num_players);
+    let timing_half_width = crate::scorebox::SCOREBOX_W * timing_frame.zoom * 0.5;
+    let left = pane_left.max(time_anchor.min(timing_frame.center_x - timing_half_width));
+    let right = pane_right.min(time_anchor.max(timing_frame.center_x + timing_half_width));
+
+    let time_remaining_y = layout.sidepane_center_y - 40.0 * layout.banner_data_zoom - 7.0;
+    let time_total_y = layout.sidepane_center_y - 40.0 * layout.banner_data_zoom + 13.0;
+    let mut occupied_bottom = if show_duration {
+        time_total_y + 10.0
+    } else {
+        layout.sidepane_center_y
+    };
+
+    if live_timing_rows > 0 {
+        let compact = live_timing_rows >= 3;
+        let row_height = if compact { 20.0 * 0.68 } else { 20.0 };
+        let first_row_y = if compact {
+            time_remaining_y - row_height * 0.12
+        } else {
+            time_remaining_y
+        };
+        let last_row_y = first_row_y + row_height * live_timing_rows.saturating_sub(1) as f32;
+        let text_zoom = layout.banner_data_zoom * 0.833 * if compact { 0.82 } else { 1.0 };
+        occupied_bottom = occupied_bottom.max(last_row_y + 8.0 * text_zoom);
+    }
+
+    let width = (right - left).max(1.0);
+    let height = (graph_top - occupied_bottom).max(1.0);
+    let pack_banner_zoom = if layout.note_field_is_centered {
         0.2
     } else {
         0.25
     };
-    let final_offset: f32 = if layout.note_field_is_centered {
-        -115.0
-    } else {
-        -160.0
-    };
-    let side_sign: f32 = match player_side {
-        PlayerSide::P1 => 1.0,
-        PlayerSide::P2 => -1.0,
-    };
+    let banner_width = (STEP_STATS_BANNER_W * pack_banner_zoom * layout.banner_data_zoom)
+        .min(width)
+        .min(height * STEP_STATS_BANNER_W / STEP_STATS_BANNER_H);
+
+    StepStatsSongInfoSlide {
+        left,
+        center_y: (occupied_bottom + graph_top) * 0.5,
+        width,
+        height,
+        banner_width,
+    }
+}
+
+#[must_use]
+pub fn pack_banner_placement(slide: StepStatsSongInfoSlide) -> StepStatsSpritePlacement {
     StepStatsSpritePlacement {
-        x: (final_offset * side_sign).mul_add(layout.banner_data_zoom, layout.sidepane_center_x),
-        y: 20.0f32.mul_add(layout.banner_data_zoom, layout.sidepane_center_y),
-        zoom: final_size * layout.banner_data_zoom,
+        x: slide.left + slide.banner_width * 0.5,
+        y: slide.center_y,
+        zoom: slide.banner_width / STEP_STATS_BANNER_W,
+    }
+}
+
+#[must_use]
+pub fn song_info_text_placement(
+    slide: StepStatsSongInfoSlide,
+    show_labels: bool,
+    text_zoom: f32,
+) -> StepStatsSongInfoTextPlacement {
+    let text_left = slide.left + slide.banner_width + STEP_STATS_SONG_INFO_PADDING;
+    let text_right = slide.left + slide.width;
+    let labels_x = text_left;
+    let values_x = if show_labels {
+        labels_x + 45.0 * text_zoom
+    } else {
+        labels_x
+    };
+
+    StepStatsSongInfoTextPlacement {
+        labels_x,
+        values_x,
+        values_max_width: (text_right - values_x - STEP_STATS_SONG_INFO_PADDING).max(1.0),
     }
 }
 
@@ -200,7 +344,7 @@ pub fn holds_mines_rolls_frame(
         PlayerSide::P2 => -85.0,
     };
     StepStatsFramePlacement {
-        center_x: layout.sidepane_center_x + local_x * layout.banner_data_zoom,
+        center_x: pane_anchor_x(layout, local_x * layout.banner_data_zoom),
         center_y: 112.0f32.mul_add(-layout.banner_data_zoom, layout.sidepane_center_y),
         zoom: layout.banner_data_zoom,
     }
@@ -225,7 +369,7 @@ pub fn scorebox_frame(
         local_x = -local_x;
     }
     StepStatsFramePlacement {
-        center_x: layout.sidepane_center_x + local_x * layout.banner_data_zoom,
+        center_x: pane_anchor_x(layout, local_x * layout.banner_data_zoom),
         center_y: 115.0f32.mul_add(-layout.banner_data_zoom, layout.sidepane_center_y),
         zoom: layout.banner_data_zoom,
     }
@@ -366,6 +510,38 @@ mod tests {
     }
 
     #[test]
+    fn pane_anchors_use_available_width_without_scaling_widget_dimensions() {
+        let mut params = base_params();
+        params.screen_w = 640.0;
+        params.screen_h = 480.0;
+        params.screen_center_x = 320.0;
+        params.screen_center_y = 240.0;
+        params.playfield_center_x = 150.0;
+        params.wide = false;
+        let layout = pane_layout(params);
+
+        assert_eq!(layout.sidepane_width, 320.0);
+        assert_eq!(pane_anchor_x(layout, -200.0), 320.0);
+        assert_eq!(pane_anchor_x(layout, 200.0), 640.0);
+        assert_eq!(
+            holds_mines_rolls_frame(layout, PlayerSide::P1),
+            StepStatsFramePlacement {
+                center_x: 604.0,
+                center_y: 208.0,
+                zoom: 1.0
+            }
+        );
+        assert_eq!(
+            pane_view_proj(640.0, 480.0),
+            Metrics::centered(640.0, 480.0).projection()
+        );
+        assert_eq!(
+            judgment_count_center_x(layout, PlayerSide::P1, false, 1),
+            328.0
+        );
+    }
+
+    #[test]
     fn ultrawide_versus_uses_outer_side_panes() {
         let layout = pane_layout(StepStatsPaneParams {
             screen_w: 2560.0,
@@ -387,12 +563,15 @@ mod tests {
     }
 
     #[test]
-    fn song_info_zoom_uses_centered_aspect_ratio_band() {
-        let mut layout = pane_layout(base_params());
-        assert_eq!(song_info_text_zoom(layout, 16.0 / 9.0), 0.9 * 0.925);
+    fn song_info_zoom_tracks_banner_data_scale() {
+        let layout = pane_layout(base_params());
+        assert_eq!(song_info_text_zoom(layout), 0.8325);
 
-        layout.note_field_is_centered = false;
-        assert_eq!(song_info_text_zoom(layout, 16.0 / 9.0), 0.75 * 0.925);
+        let mut params = base_params();
+        params.playfield_center_x = 600.0;
+        let off_center_layout = pane_layout(params);
+        assert_eq!(off_center_layout.banner_data_zoom, 1.0);
+        assert_eq!(song_info_text_zoom(off_center_layout), 0.75);
     }
 
     #[test]
@@ -453,24 +632,30 @@ mod tests {
     }
 
     #[test]
-    fn pack_banner_placement_uses_centered_scale_and_offset() {
+    fn pack_banner_and_song_info_share_the_available_slide() {
         let layout = StepStatsPaneLayout {
             sidepane_center_x: 500.0,
             sidepane_center_y: 300.0,
-            sidepane_width: 400.0,
-            note_field_is_centered: true,
+            sidepane_width: 320.0,
+            note_field_is_centered: false,
             is_ultrawide: false,
-            banner_data_zoom: 2.0,
+            banner_data_zoom: 1.0,
         };
+        let slide = song_info_slide(layout, PlayerSide::P1, false, 1, true, 3, 355.0);
+        let banner = pack_banner_placement(slide);
+        let text = song_info_text_placement(slide, true, 0.75);
 
+        assert_eq!(slide.left, 348.0);
+        assert_eq!(slide.width, 289.0);
+        assert!((slide.center_y + slide.height * 0.5 - 355.0).abs() < 0.001);
         assert_eq!(
-            pack_banner_placement(layout, PlayerSide::P1),
-            StepStatsSpritePlacement {
-                x: 270.0,
-                y: 340.0,
-                zoom: 0.4
-            }
+            banner.x - STEP_STATS_BANNER_W * banner.zoom * 0.5,
+            slide.left
         );
+        assert_eq!(banner.y, slide.center_y);
+        assert_eq!(banner.zoom, 0.25);
+        assert!(text.labels_x >= banner.x + STEP_STATS_BANNER_W * banner.zoom * 0.5);
+        assert!(text.values_x + text.values_max_width <= slide.left + slide.width);
     }
 
     #[test]
